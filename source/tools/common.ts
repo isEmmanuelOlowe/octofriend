@@ -57,6 +57,9 @@ export type ToolDef<T> = {
     t: T,
     cfg: Config,
     modelOverride: string | null,
+    meta?: {
+      toolCallId?: string;
+    },
   ) => Promise<ToolResult>;
 };
 

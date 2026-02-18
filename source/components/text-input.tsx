@@ -8,6 +8,16 @@ import { wrapTextWithMapping } from "../text-wrap.ts";
 type Props = {
   readonly placeholder?: string;
   readonly focus?: boolean;
+  readonly onInputKey?: (
+    input: string,
+    key: {
+      ctrl?: boolean;
+      shift?: boolean;
+      meta?: boolean;
+      rightArrow?: boolean;
+      leftArrow?: boolean;
+    },
+  ) => boolean;
   readonly mask?: string;
   readonly showCursor?: boolean;
   readonly highlightPastedText?: boolean;
@@ -19,6 +29,11 @@ type Props = {
   readonly setVimMode?: (mode: "NORMAL" | "INSERT") => void;
 };
 
+function isMouseEscapeSequence(input: string): boolean {
+  if (!input) return false;
+  return /(?:\x1b)?\[<\d+;\d+;\d+[mM]/.test(input) || /(?:\x1b)?\[\d+;\d+;\d+M/.test(input);
+}
+
 export default function TextInput({
   value: originalValue,
   placeholder = "",
@@ -28,6 +43,7 @@ export default function TextInput({
   showCursor = true,
   onChange,
   onSubmit,
+  onInputKey,
   vimEnabled = false,
   vimMode = "NORMAL",
   setVimMode,
@@ -154,8 +170,25 @@ export default function TextInput({
     (input, key) => {
       if (isInitializing) return;
 
+      if (
+        onInputKey?.(input, {
+          ctrl: key.ctrl,
+          shift: key.shift,
+          meta: key.meta,
+          rightArrow: key.rightArrow,
+          leftArrow: key.leftArrow,
+        }) === true
+      ) {
+        return;
+      }
+
       // Prevent Ctrl+p from being typed into input (it opens the menu)
       if (key.ctrl && input === "p") {
+        return;
+      }
+
+      // Ignore terminal mouse-wheel escape sequences so they don't appear as typed text.
+      if (isMouseEscapeSequence(input)) {
         return;
       }
 

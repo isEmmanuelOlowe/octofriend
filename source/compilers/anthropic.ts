@@ -11,6 +11,86 @@ import { compactionCompilerExplanation } from "./autocompact.ts";
 import { JsonFixResponse } from "../prompts/autofix-prompts.ts";
 import * as irPrompts from "../prompts/ir-prompts.ts";
 
+const MAX_ASSISTANT_CONTENT_CHARS = 500_000;
+const MAX_ASSISTANT_REASONING_CHARS = 200_000;
+const MAX_TOOL_ARGUMENT_CHARS = 500_000;
+const TRUNCATION_MARKER = "\n...[truncated]";
+
+interface AppendCappedResult {
+  result: string;
+  wasTruncated: boolean;
+}
+
+function appendCapped(base: string, addition: string, maxChars: number): string {
+  if (addition.length === 0 || maxChars <= 0) return base;
+  if (base.length >= maxChars) return base;
+  const remaining = maxChars - base.length;
+  if (addition.length <= remaining) return base + addition;
+  return base + addition.slice(0, remaining);
+}
+
+function appendCappedWithTracking(
+  base: string,
+  addition: string,
+  maxChars: number,
+  currentLength: number,
+  maxTotalLength: number,
+): AppendCappedResult {
+  // Check global limit first
+  const globalRemaining = maxTotalLength - currentLength;
+  if (globalRemaining <= 0) {
+    return { result: base, wasTruncated: true };
+  }
+
+  // Apply the more restrictive of per-block and global limits
+  const effectiveMax = Math.min(maxChars, base.length + globalRemaining);
+
+  if (addition.length === 0 || effectiveMax <= 0) {
+    return { result: base, wasTruncated: false };
+  }
+  if (base.length >= effectiveMax) {
+    return { result: base, wasTruncated: true };
+  }
+
+  const remaining = effectiveMax - base.length;
+  if (addition.length <= remaining) {
+    return { result: base + addition, wasTruncated: false };
+  }
+  return { result: base + addition.slice(0, remaining), wasTruncated: true };
+}
+
+function appendCappedWithMarker(
+  base: string,
+  addition: string,
+  maxChars: number,
+): AppendCappedResult {
+  if (addition.length === 0 || maxChars <= 0) {
+    return { result: base, wasTruncated: false };
+  }
+  if (base.length >= maxChars) {
+    return { result: base, wasTruncated: true };
+  }
+
+  const remaining = maxChars - base.length;
+  // Reserve space for truncation marker
+  const availableSpace = remaining - TRUNCATION_MARKER.length;
+
+  if (availableSpace <= 0) {
+    // No space for content, just return base
+    return { result: base, wasTruncated: true };
+  }
+
+  if (addition.length <= availableSpace) {
+    return { result: base + addition, wasTruncated: false };
+  }
+
+  // Truncated - append marker to signal truncation
+  return {
+    result: base + addition.slice(0, availableSpace) + TRUNCATION_MARKER,
+    wasTruncated: true,
+  };
+}
+
 const ThinkingBlockSchema = t.subtype({
   type: t.value("thinking"),
   thinking: t.str,
@@ -242,6 +322,7 @@ export const runAnthropicAgent: Compiler = async ({
   });
 
   const thinking: { thinking?: { type: "enabled"; budget_tokens: number } } = {};
+  const allowReasoning = model.reasoning != null;
   if (model.reasoning) {
     thinking.thinking = {
       type: "enabled",
@@ -283,6 +364,9 @@ export const runAnthropicAgent: Compiler = async ({
 
     let content = "";
     let reasoningContent: string | undefined = undefined;
+    let reasoningTruncated = false;
+    let toolArgsTruncated = false;
+    let cumulativeReasoningLength = 0;
     let usage = {
       input: 0,
       output: 0,
@@ -316,33 +400,70 @@ export const runAnthropicAgent: Compiler = async ({
         case "content_block_delta":
           switch (chunk.delta.type) {
             case "text_delta":
-              content += chunk.delta.text;
+              content = appendCapped(content, chunk.delta.text, MAX_ASSISTANT_CONTENT_CHARS);
               onTokens(chunk.delta.text, "content");
               break;
             case "thinking_delta":
+              if (!allowReasoning) break;
               if (reasoningContent == null) reasoningContent = "";
-              reasoningContent += chunk.delta.thinking;
+
+              // Track cumulative thinking content globally
+              const thinkingAppendResult = appendCappedWithTracking(
+                reasoningContent,
+                chunk.delta.thinking,
+                MAX_ASSISTANT_REASONING_CHARS,
+                cumulativeReasoningLength,
+                MAX_ASSISTANT_REASONING_CHARS,
+              );
+              reasoningContent = thinkingAppendResult.result;
+              if (thinkingAppendResult.wasTruncated) {
+                reasoningTruncated = true;
+              }
+              cumulativeReasoningLength += chunk.delta.thinking.length;
+
               onTokens(chunk.delta.thinking, "reasoning");
               if (thinkingBlocks.length === 0) {
+                const blockResult = appendCappedWithTracking(
+                  "",
+                  chunk.delta.thinking,
+                  MAX_ASSISTANT_REASONING_CHARS,
+                  cumulativeReasoningLength - chunk.delta.thinking.length,
+                  MAX_ASSISTANT_REASONING_CHARS,
+                );
                 thinkingBlocks.push({
                   type: "thinking",
-                  thinking: chunk.delta.thinking,
+                  thinking: blockResult.result,
                   index: chunk.index,
                 });
               } else {
                 const lastBlock = thinkingBlocks[thinkingBlocks.length - 1];
                 if (lastBlock.type === "thinking" && lastBlock.index === chunk.index) {
-                  lastBlock.thinking += chunk.delta.thinking;
+                  const blockResult = appendCappedWithTracking(
+                    lastBlock.thinking || "",
+                    chunk.delta.thinking,
+                    MAX_ASSISTANT_REASONING_CHARS,
+                    cumulativeReasoningLength - chunk.delta.thinking.length,
+                    MAX_ASSISTANT_REASONING_CHARS,
+                  );
+                  lastBlock.thinking = blockResult.result;
                 } else {
+                  const blockResult = appendCappedWithTracking(
+                    "",
+                    chunk.delta.thinking,
+                    MAX_ASSISTANT_REASONING_CHARS,
+                    cumulativeReasoningLength - chunk.delta.thinking.length,
+                    MAX_ASSISTANT_REASONING_CHARS,
+                  );
                   thinkingBlocks.push({
                     type: "thinking",
-                    thinking: chunk.delta.thinking,
+                    thinking: blockResult.result,
                     index: chunk.index,
                   });
                 }
               }
               break;
             case "signature_delta":
+              if (!allowReasoning) break;
               if (thinkingBlocks.length === 0) {
                 thinkingBlocks.push({
                   type: "thinking",
@@ -365,7 +486,15 @@ export const runAnthropicAgent: Compiler = async ({
             case "input_json_delta":
               if (inProgressTool != null && inProgressTool.index === chunk.index) {
                 onTokens(chunk.delta.partial_json, "tool");
-                inProgressTool.partialJson += chunk.delta.partial_json;
+                const appendResult = appendCappedWithMarker(
+                  inProgressTool.partialJson,
+                  chunk.delta.partial_json,
+                  MAX_TOOL_ARGUMENT_CHARS,
+                );
+                inProgressTool.partialJson = appendResult.result;
+                if (appendResult.wasTruncated) {
+                  toolArgsTruncated = true;
+                }
               }
               break;
           }
@@ -384,6 +513,7 @@ export const runAnthropicAgent: Compiler = async ({
               }
               break;
             case "redacted_thinking":
+              if (!allowReasoning) break;
               thinkingBlocks.push({
                 type: "redacted_thinking",
                 data: chunk.content_block.data,
@@ -420,7 +550,7 @@ export const runAnthropicAgent: Compiler = async ({
     }
 
     let anthropic: { anthropic?: AnthropicAssistantData } = {};
-    if (thinkingBlocks.length > 0) {
+    if (allowReasoning && thinkingBlocks.length > 0) {
       anthropic.anthropic = {
         thinkingBlocks: thinkingBlocks.map(b => {
           if (b.type === "redacted_thinking") return b;
@@ -452,6 +582,24 @@ export const runAnthropicAgent: Compiler = async ({
     // No tools? Return
     if (inProgressTool == null) {
       return { success: true, output: [assistantMessage], curl };
+    }
+
+    // If tool arguments were truncated, fail deterministically
+    if (toolArgsTruncated) {
+      return {
+        success: true,
+        curl,
+        output: [
+          assistantMessage,
+          {
+            role: "tool-malformed",
+            error: `Tool call arguments exceeded maximum length of ${MAX_TOOL_ARGUMENT_CHARS} characters and were truncated. The tool call cannot be processed.`,
+            toolCallId: inProgressTool.id,
+            toolName: inProgressTool.name,
+            arguments: inProgressTool.partialJson,
+          },
+        ],
+      };
     }
 
     // Get tool calls

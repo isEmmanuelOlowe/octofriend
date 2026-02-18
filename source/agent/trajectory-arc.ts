@@ -11,6 +11,7 @@ import { systemPrompt } from "../prompts/system-prompt.ts";
 import { makeAutofixJson } from "../compilers/autofix.ts";
 import { JsonFixResponse } from "../prompts/autofix-prompts.ts";
 import { loadTools } from "../tools/index.ts";
+import { Agent } from "../agents/agents.ts";
 
 type AllTokenTypes = "reasoning" | "content" | "tool";
 
@@ -25,6 +26,24 @@ type AssistantDelta<AllowedType extends string> = {
 type CompactionType = {
   checkpoint: CompactionCheckpoint;
 };
+
+const MAX_TRAJECTORY_BUFFER_CONTENT_CHARS = 500_000;
+const MAX_TRAJECTORY_BUFFER_REASONING_CHARS = 200_000;
+const MAX_TRAJECTORY_BUFFER_TOOL_CHARS = 500_000;
+
+function appendCapped(base: string, addition: string, maxChars: number): string {
+  if (addition.length === 0 || maxChars <= 0) return base;
+  if (base.length >= maxChars) return base;
+  const remaining = maxChars - base.length;
+  if (addition.length <= remaining) return base + addition;
+  return base + addition.slice(0, remaining);
+}
+
+function bufferCap(type: AllTokenTypes): number {
+  if (type === "reasoning") return MAX_TRAJECTORY_BUFFER_REASONING_CHARS;
+  if (type === "tool") return MAX_TRAJECTORY_BUFFER_TOOL_CHARS;
+  return MAX_TRAJECTORY_BUFFER_CONTENT_CHARS;
+}
 
 // TODO: compaction actually shouldn't allow for tools, so run() should be modified to not emit
 // tokens of type `tool` if no tools are given. (In practice it already doesn't emit them, it just
@@ -85,7 +104,10 @@ export async function trajectoryArc({
   config,
   transport,
   abortSignal,
+  agent,
+  agents,
   handler,
+  retryBudget = 8,
 }: {
   apiKey: string;
   model: ModelConfig;
@@ -93,16 +115,19 @@ export async function trajectoryArc({
   config: Config;
   transport: Transport;
   abortSignal: AbortSignal;
+  agent?: Agent;
+  agents?: Agent[];
   handler: {
     [K in AnyState]: (state: StateEvents[K]) => void;
   };
+  retryBudget?: number;
 }): Promise<Finish> {
   if (abortSignal.aborted) return abort([]);
 
   const messagesCopy = [...messages];
   const autofixJson = makeAutofixJson(config);
   let irs: TrajectoryOutputIR[] = [];
-  const tools = await loadTools(transport, abortSignal, config);
+  const tools = await loadTools(transport, abortSignal, config, { agent, agents });
 
   const parsedCompaction = await maybeAutocompact({
     apiKey,
@@ -135,8 +160,8 @@ export async function trajectoryArc({
     messages: messagesCopy,
     handlers: {
       onTokens: (tokens, type) => {
-        if (!buffer[type]) buffer[type] = "";
-        buffer[type] += tokens;
+        const current = buffer[type] ?? "";
+        buffer[type] = appendCapped(current, tokens, bufferCap(type));
         handler.responseProgress({
           buffer,
           delta: { type, value: tokens },
@@ -152,22 +177,32 @@ export async function trajectoryArc({
         transport,
         tools,
         signal: abortSignal,
+        agent,
+        agents,
       });
     },
   });
 
   function maybeBufferedMessage(): TrajectoryOutputIR[] {
     if (buffer.content || buffer.reasoning || buffer.tool) {
-      return [
-        ...irs,
-        {
-          role: "assistant",
-          content: buffer.content || "",
-          reasoningContent: buffer.reasoning,
-          tokenUsage: 0,
-          outputTokens: 0,
-        },
-      ];
+      const results: TrajectoryOutputIR[] = [...irs];
+
+      // Include any partial tool content in the assistant message to preserve context
+      // This handles the case where a run aborts mid-tool-call
+      const content = buffer.content || "";
+      const pendingToolContent = buffer.tool;
+
+      results.push({
+        role: "assistant",
+        content: pendingToolContent
+          ? `${content}\n<partial_tool_call>${pendingToolContent}</partial_tool_call>`
+          : content,
+        reasoningContent: buffer.reasoning,
+        tokenUsage: 0,
+        outputTokens: 0,
+      });
+
+      return results;
     }
     return [];
   }
@@ -203,6 +238,18 @@ export async function trajectoryArc({
 
   // Retry malformed tool calls
   if (lastIr.role === "tool-malformed") {
+    if (retryBudget <= 0) {
+      return {
+        type: "finish",
+        irs: [...irs],
+        reason: {
+          type: "request-error",
+          requestError:
+            "Too many malformed tool retries in a single response arc. Aborting to prevent runaway memory growth.",
+          curl: result.curl,
+        },
+      };
+    }
     handler.retryTool({ irs });
     const retried = await trajectoryArc({
       apiKey,
@@ -210,8 +257,11 @@ export async function trajectoryArc({
       config,
       transport,
       abortSignal,
+      agent,
+      agents,
       messages: messagesCopy.concat(irs),
       handler,
+      retryBudget: retryBudget - 1,
     });
 
     return {
@@ -252,6 +302,18 @@ export async function trajectoryArc({
         e,
       );
       const retryIrs = [...irs, errorIrs];
+      if (retryBudget <= 0) {
+        return {
+          type: "finish",
+          irs: retryIrs,
+          reason: {
+            type: "request-error",
+            requestError:
+              "Too many tool retry attempts in a single response arc. Aborting to prevent runaway memory growth.",
+            curl: result.curl,
+          },
+        };
+      }
       handler.retryTool({ irs: retryIrs });
       const retried = await trajectoryArc({
         apiKey,
@@ -259,8 +321,11 @@ export async function trajectoryArc({
         config,
         transport,
         abortSignal,
+        agent,
+        agents,
         messages: messagesCopy.concat(retryIrs),
         handler,
+        retryBudget: retryBudget - 1,
       });
       return {
         type: "finish",
@@ -331,6 +396,18 @@ export async function trajectoryArc({
         error: e.message,
       },
     ];
+    if (retryBudget <= 0) {
+      return {
+        type: "finish",
+        irs: retryIrs,
+        reason: {
+          type: "request-error",
+          requestError:
+            "Too many tool retry attempts in a single response arc. Aborting to prevent runaway memory growth.",
+          curl: result.curl,
+        },
+      };
+    }
     handler.retryTool({ irs: retryIrs });
     const retried = await trajectoryArc({
       apiKey,
@@ -338,8 +415,11 @@ export async function trajectoryArc({
       config,
       transport,
       abortSignal,
+      agent,
+      agents,
       messages: messagesCopy.concat(retryIrs),
       handler,
+      retryBudget: retryBudget - 1,
     });
     return {
       type: "finish",
@@ -380,8 +460,8 @@ async function maybeAutocompact({
     autofixJson,
     handlers: {
       onTokens: (tokens, type) => {
-        if (!buffer[type]) buffer[type] = "";
-        buffer[type] += tokens;
+        const current = buffer[type] ?? "";
+        buffer[type] = appendCapped(current, tokens, bufferCap(type));
         handler.compactionProgress({
           type: "autocompaction-stream",
           buffer,

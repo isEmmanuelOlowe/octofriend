@@ -60,6 +60,55 @@ const ResponseToolCallSchema = t.subtype({
 type ResponseToolCall = t.GetType<typeof ResponseToolCallSchema>;
 
 const TOOL_ERROR_TAG = "tool-error";
+const MAX_ASSISTANT_CONTENT_CHARS = 500_000;
+const MAX_ASSISTANT_REASONING_CHARS = 200_000;
+const MAX_TOOL_ARGUMENT_CHARS = 500_000;
+const TRUNCATION_MARKER = "...[truncated]";
+
+interface AppendCappedResult {
+  result: string;
+  wasTruncated: boolean;
+}
+
+function appendCapped(base: string, addition: string, maxChars: number): string {
+  if (addition.length === 0 || maxChars <= 0) return base;
+  if (base.length >= maxChars) return base;
+  const remaining = maxChars - base.length;
+  if (addition.length <= remaining) return base + addition;
+  return base + addition.slice(0, remaining);
+}
+
+function appendCappedWithMarker(
+  base: string,
+  addition: string,
+  maxChars: number,
+): AppendCappedResult {
+  if (addition.length === 0 || maxChars <= 0) {
+    return { result: base, wasTruncated: false };
+  }
+  if (base.length >= maxChars) {
+    return { result: base, wasTruncated: true };
+  }
+
+  const remaining = maxChars - base.length;
+  // Reserve space for truncation marker
+  const availableSpace = remaining - TRUNCATION_MARKER.length;
+
+  if (availableSpace <= 0) {
+    // No space for content, just return base
+    return { result: base, wasTruncated: true };
+  }
+
+  if (addition.length <= availableSpace) {
+    return { result: base + addition, wasTruncated: false };
+  }
+
+  // Truncated - append marker to signal truncation
+  return {
+    result: base + addition.slice(0, availableSpace) + TRUNCATION_MARKER,
+    wasTruncated: true,
+  };
+}
 
 function generateCurlFrom(params: {
   baseURL: string;
@@ -315,6 +364,7 @@ export const runAgent: Compiler = async ({
       reasoning_effort?: "low" | "medium" | "high";
     } = {};
     if (model.reasoning) reasoning.reasoning_effort = model.reasoning;
+    const allowReasoning = model.reasoning != null;
 
     const res = await client.chat.completions.create(
       {
@@ -335,6 +385,7 @@ export const runAgent: Compiler = async ({
     let content = "";
     let reasoningContent: undefined | string = undefined;
     let inThinkTag = false;
+    let toolArgsTruncated = false;
     let usage = {
       input: 0,
       output: 0,
@@ -353,12 +404,17 @@ export const runAgent: Compiler = async ({
 
         onText: e => {
           if (inThinkTag) {
+            if (!allowReasoning) return;
             if (reasoningContent == null) reasoningContent = "";
-            reasoningContent += e.content;
+            reasoningContent = appendCapped(
+              reasoningContent,
+              e.content,
+              MAX_ASSISTANT_REASONING_CHARS,
+            );
             onTokens(e.content, "reasoning");
           } else {
             onTokens(e.content, "content");
-            content += e.content;
+            content = appendCapped(content, e.content, MAX_ASSISTANT_CONTENT_CHARS);
           }
         },
       },
@@ -392,8 +448,13 @@ export const runAgent: Compiler = async ({
           const tokens = delta.content || "";
           xmlParser.write(tokens);
         } else if (delta && "reasoning_content" in delta && delta.reasoning_content) {
+          if (!allowReasoning) continue;
           if (reasoningContent == null) reasoningContent = "";
-          reasoningContent += delta.reasoning_content;
+          reasoningContent = appendCapped(
+            reasoningContent,
+            delta.reasoning_content,
+            MAX_ASSISTANT_REASONING_CHARS,
+          );
           onTokens(delta.reasoning_content, "reasoning");
         } else if (
           delta &&
@@ -407,21 +468,43 @@ export const runAgent: Compiler = async ({
               "tool",
             );
             if (currTool == null) {
-              currTool = {
-                id: deltaCall.id,
-                function: {
-                  name: deltaCall.function.name || "",
-                  arguments: deltaCall.function.arguments || "",
-                },
-              };
+              // Check if first chunk of arguments exceeds limit
+              const initialArgs = deltaCall.function.arguments || "";
+              if (initialArgs.length > MAX_TOOL_ARGUMENT_CHARS) {
+                toolArgsTruncated = true;
+                currTool = {
+                  id: deltaCall.id,
+                  function: {
+                    name: deltaCall.function.name || "",
+                    arguments: initialArgs.slice(0, MAX_TOOL_ARGUMENT_CHARS) + TRUNCATION_MARKER,
+                  },
+                };
+              } else {
+                currTool = {
+                  id: deltaCall.id,
+                  function: {
+                    name: deltaCall.function.name || "",
+                    arguments: initialArgs,
+                  },
+                };
+              }
             } else {
               if (deltaCall.id && deltaCall.id !== currTool.id) {
                 doneParsingTools = true;
                 break;
               }
               if (deltaCall.function.name) currTool.function!.name = deltaCall.function.name;
-              if (deltaCall.function.arguments)
-                currTool.function!.arguments += deltaCall.function.arguments;
+              if (deltaCall.function.arguments) {
+                const appendResult = appendCappedWithMarker(
+                  currTool.function!.arguments,
+                  deltaCall.function.arguments,
+                  MAX_TOOL_ARGUMENT_CHARS,
+                );
+                currTool.function!.arguments = appendResult.result;
+                if (appendResult.wasTruncated) {
+                  toolArgsTruncated = true;
+                }
+              }
             }
           }
         }
@@ -462,6 +545,26 @@ export const runAgent: Compiler = async ({
 
     // If no tool call, we're done
     if (currTool == null) return { success: true, output: [assistantIr], curl };
+
+    // If tool arguments were truncated, fail deterministically
+    if (toolArgsTruncated) {
+      const toolCallId = currTool["id"];
+      if (toolCallId == null) throw new Error("Impossible tool call: no id given");
+      return {
+        success: true,
+        curl,
+        output: [
+          assistantIr,
+          {
+            role: "tool-malformed",
+            error: `Tool call arguments exceeded maximum length of ${MAX_TOOL_ARGUMENT_CHARS} characters and were truncated. The tool call cannot be processed.`,
+            toolCallId,
+            toolName: currTool.function?.name,
+            arguments: currTool.function?.arguments,
+          },
+        ],
+      };
+    }
 
     // Got this far? Parse out the tool call
     const validatedTool = ResponseToolCallSchema.sliceResult(currTool);

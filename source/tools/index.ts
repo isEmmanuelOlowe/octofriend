@@ -3,6 +3,7 @@ import toolMap from "./tool-defs/index.ts";
 import { ToolDef, ToolResult, ToolError } from "./common.ts";
 import { Config } from "../config.ts";
 import { Transport } from "../transports/transport-common.ts";
+import { Agent, filterToolsForAgent } from "../agents/agents.ts";
 export { ToolError } from "./common.ts";
 
 export type LoadedTools = {
@@ -14,6 +15,10 @@ export async function loadTools(
   transport: Transport,
   signal: AbortSignal,
   config: Config,
+  options?: {
+    agent?: Agent;
+    agents?: Agent[];
+  },
 ): Promise<Partial<LoadedTools>> {
   const loaded: Partial<LoadedTools> = {};
 
@@ -26,6 +31,10 @@ export async function loadTools(
       }
     }),
   );
+
+  if (options?.agent) {
+    return filterToolsForAgent(options.agent, loaded) as LoadedTools;
+  }
 
   return loaded as LoadedTools;
 }
@@ -47,9 +56,12 @@ export async function runTool(
   call: ToolCall,
   config: Config,
   modelOverride: string | null,
+  meta?: {
+    toolCallId?: string;
+  },
 ): Promise<ToolResult> {
   const def = lookup(loaded, call);
-  return await def.run(abortSignal, transport, call, config, modelOverride);
+  return await def.run(abortSignal, transport, call, config, modelOverride, meta);
 }
 
 export async function validateTool(

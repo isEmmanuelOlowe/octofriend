@@ -3,10 +3,15 @@ import React, { useEffect, useState, useRef, useCallback, createContext } from "
 import { useColor } from "../theme.ts";
 
 // https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Extended-coordinates
+// SGR 1006 mode is more reliable than basic 1000 mode
 const MOUSE_PATTERNS = {
-  URXVT: /\x1b\[(\d+);(\d+);(\d+)M/, // 3 numbers separated by semicolons
-  SGR: /\x1b\[<(\d+);(\d+);(\d+)([Mm])/, // like URXVT but ends with m or M
-  UTF8: /\x1b\[M(.)(.)(.)/, // 3 characters
+  // SGR format: \x1b[<button;col;row;M or m
+  // M = pressed, m = released
+  SGR: /\x1b\[<(\d+);(\d+);(\d+)([Mm])/,
+  // URXVT format: \x1b[button;col;rowM
+  URXVT: /\x1b\[(\d+);(\d+);(\d+)M/,
+  // UTF8 format: \x1b[M<button_byte><col_byte><row_byte>
+  UTF8: /\x1b\[M(.)(.)(.)/,
 } as const;
 
 const SCROLL_DIRECTIONS = {
@@ -17,23 +22,24 @@ const SCROLL_DIRECTIONS = {
 type ScrollDirection = (typeof SCROLL_DIRECTIONS)[keyof typeof SCROLL_DIRECTIONS];
 
 const MOUSE_BUTTONS = {
-  // https://manpages.ubuntu.com/manpages/jammy/man7/urxvt.7.html#mouse%20reporting escape code reference
+  // SGR 1006 mode button values
   SGR: {
     [SCROLL_DIRECTIONS.SCROLL_UP]: 64,
     [SCROLL_DIRECTIONS.SCROLL_DOWN]: 65,
   },
-  // https://manpages.ubuntu.com/manpages/jammy/man7/urxvt.7.html#key%20codes 64/65 with an offset of 32
+  // URXVT uses same values but with offset
   URXVT: {
     [SCROLL_DIRECTIONS.SCROLL_UP]: 96,
     [SCROLL_DIRECTIONS.SCROLL_DOWN]: 97,
   },
 };
 
-// ASCII Escape codes reference:
-// https://manpages.ubuntu.com/manpages/jammy/man7/urxvt.7.html
+// Mouse tracking escape sequences
+// 1006 = SGR extended coordinates (more reliable)
+// 1000 = basic mouse tracking
 const MOUSE_TRACKING = {
-  ENABLE: "\x1b[?1000h",
-  DISABLE: "\x1b[?1000l",
+  ENABLE: "\x1b[?1006h\x1b[?1000h",
+  DISABLE: "\x1b[?1000l\x1b[?1006l",
 } as const;
 
 export interface ScrollViewProps extends React.PropsWithChildren {
@@ -66,7 +72,7 @@ export function ScrollView({ height, children }: ScrollViewProps) {
   const handleScroll = useCallback(
     (direction: ScrollDirection) => {
       setScrollTop(prev => {
-        const delta = direction === SCROLL_DIRECTIONS.SCROLL_UP ? -1 : 1;
+        const delta = direction === SCROLL_DIRECTIONS.SCROLL_UP ? -3 : 3;
         const newScrollTop = prev + delta;
         const maxScroll = Math.max(0, innerHeight - height);
         const scrollPercentage = maxScroll > 0 ? Math.round((newScrollTop / maxScroll) * 100) : 0;
@@ -89,28 +95,20 @@ export function ScrollView({ height, children }: ScrollViewProps) {
     };
   }, [handleElementSize]);
 
+  // Mouse wheel scrolling support
   useEffect(() => {
     if (!stdin || !setRawMode || !isScrollable) {
       return;
     }
 
+    // Enable mouse tracking
     setRawMode(true);
     process.stdout.write(MOUSE_TRACKING.ENABLE);
 
     const handleData = (data: Buffer) => {
       const str = data.toString();
 
-      const urxvtMatch = str.match(MOUSE_PATTERNS.URXVT);
-      if (urxvtMatch) {
-        const button = parseInt(urxvtMatch[1], 10);
-        if (button === MOUSE_BUTTONS.URXVT.SCROLL_UP) {
-          handleScroll(SCROLL_DIRECTIONS.SCROLL_UP);
-        } else if (button === MOUSE_BUTTONS.URXVT.SCROLL_DOWN) {
-          handleScroll(SCROLL_DIRECTIONS.SCROLL_DOWN);
-        }
-        return;
-      }
-
+      // Try SGR 1006 format first (most reliable)
       const sgrMatch = str.match(MOUSE_PATTERNS.SGR);
       if (sgrMatch) {
         const button = parseInt(sgrMatch[1], 10);
@@ -122,6 +120,19 @@ export function ScrollView({ height, children }: ScrollViewProps) {
         return;
       }
 
+      // Try URXVT format
+      const urxvtMatch = str.match(MOUSE_PATTERNS.URXVT);
+      if (urxvtMatch) {
+        const button = parseInt(urxvtMatch[1], 10);
+        if (button === MOUSE_BUTTONS.URXVT.SCROLL_UP) {
+          handleScroll(SCROLL_DIRECTIONS.SCROLL_UP);
+        } else if (button === MOUSE_BUTTONS.URXVT.SCROLL_DOWN) {
+          handleScroll(SCROLL_DIRECTIONS.SCROLL_DOWN);
+        }
+        return;
+      }
+
+      // Try UTF8 format
       const utf8Match = str.match(MOUSE_PATTERNS.UTF8);
       if (utf8Match) {
         const button = utf8Match[1].charCodeAt(0);
@@ -171,6 +182,7 @@ export function ScrollView({ height, children }: ScrollViewProps) {
           flexDirection="column"
           flexShrink={0}
           overflow="hidden"
+          overflowY={isScrollable ? undefined : "hidden"}
           {...(isScrollable && scrollableStyles)}
         >
           <Box ref={innerRef} flexDirection="column" flexShrink={0} marginTop={-scrollTop}>

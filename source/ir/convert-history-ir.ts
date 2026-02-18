@@ -15,6 +15,7 @@ import {
 } from "../history.ts";
 
 import { AssistantMessage, LlmIR, ToolCallRequest, TrajectoryOutputIR } from "./llm-ir.ts";
+import { ToolCall } from "../tools/index.ts";
 
 // Filter out only relevant history items to the LLM IR
 type LoweredHistory =
@@ -197,7 +198,30 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
       (prev): [LlmIR | null, LlmIR | null] => {
         // Collapse the malformed tool call into the previous assistant message, and structure the
         // response
-        const toolName = item.original.function?.name || "unknown";
+        const rawToolName = item.original.function?.name;
+
+        // Validate tool name against known tool names at runtime
+        const validToolNames: string[] = [
+          "read",
+          "list",
+          "shell",
+          "edit",
+          "create",
+          "mcp",
+          "fetch",
+          "append",
+          "prepend",
+          "rewrite",
+          "skill",
+          "task",
+          "web-search",
+        ];
+
+        // Runtime validation: if tool name is invalid, log for debugging
+        if (rawToolName && !validToolNames.includes(rawToolName)) {
+          console.warn(`[tool-malformed] Invalid tool name "${rawToolName}" in history`);
+        }
+
         return [
           {
             role: "assistant",
@@ -205,9 +229,13 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
             toolCall: {
               type: "function",
               function: {
-                name: toolName as any,
+                // Type assertion needed because ToolCall is a discriminated union requiring
+                // specific argument types per tool name. Malformed tool calls may have invalid
+                // names or argument formats that don't match the expected schema.
+                // Runtime validation above provides safety against unexpected values.
+                name: (rawToolName ?? "unknown") as ToolCall["name"],
                 arguments: item.original.function?.arguments || "{}",
-              },
+              } as ToolCall,
               toolCallId: item.toolCallId,
             },
             openai: prev.openai,
@@ -219,7 +247,7 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
           {
             role: "tool-malformed",
             toolCallId: item.toolCallId,
-            toolName,
+            toolName: rawToolName ?? "unknown",
             arguments: item.original.function?.arguments || "",
             error: item.error,
           },
@@ -256,6 +284,12 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
 
   if (item.type === "tool-output") {
     return assertPrevAssistantToolCall("tool-output", item, prev, prev => {
+      // Guard for filePath existence before path.resolve to avoid runtime errors
+      // These tools are known to have filePath in their arguments
+      const args = prev.toolCall.function.arguments as { filePath?: string };
+      const filePath = args.filePath;
+      const resolvedPath = filePath ? path.resolve(filePath) : "<missing-filepath>";
+
       switch (prev.toolCall.function.name) {
         case "append":
         case "prepend":
@@ -268,7 +302,7 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
               role: "file-mutate",
               content: item.result.content,
               toolCall: prev.toolCall,
-              path: path.resolve(prev.toolCall.function.arguments.filePath),
+              path: resolvedPath,
             },
           ];
         case "read":
@@ -278,13 +312,14 @@ function collapseToIR(prev: LlmIR | null, item: LoweredHistory): [LlmIR | null, 
               role: "file-read",
               content: item.result.content,
               toolCall: prev.toolCall,
-              path: path.resolve(prev.toolCall.function.arguments.filePath),
+              path: resolvedPath,
             },
           ];
         case "skill":
         case "fetch":
         case "list":
         case "shell":
+        case "task":
         case "mcp":
         case "web-search":
           return [

@@ -12,6 +12,52 @@ import { compactionCompilerExplanation } from "./autocompact.ts";
 import { JsonFixResponse } from "../prompts/autofix-prompts.ts";
 import * as irPrompts from "../prompts/ir-prompts.ts";
 
+const MAX_ASSISTANT_CONTENT_CHARS = 500_000;
+const MAX_ASSISTANT_REASONING_CHARS = 200_000;
+
+interface AppendCappedResult {
+  result: string;
+  wasTruncated: boolean;
+}
+
+function appendCapped(base: string, addition: string, maxChars: number): string {
+  if (addition.length === 0 || maxChars <= 0) return base;
+  if (base.length >= maxChars) return base;
+  const remaining = maxChars - base.length;
+  if (addition.length <= remaining) return base + addition;
+  return base + addition.slice(0, remaining);
+}
+
+function appendCappedWithTracking(
+  base: string,
+  addition: string,
+  maxChars: number,
+  currentLength: number,
+  maxTotalLength: number,
+): AppendCappedResult {
+  // Check global limit first
+  const globalRemaining = maxTotalLength - currentLength;
+  if (globalRemaining <= 0) {
+    return { result: base, wasTruncated: true };
+  }
+
+  // Apply the more restrictive of per-block and global limits
+  const effectiveMax = Math.min(maxChars, base.length + globalRemaining);
+
+  if (addition.length === 0 || effectiveMax <= 0) {
+    return { result: base, wasTruncated: false };
+  }
+  if (base.length >= effectiveMax) {
+    return { result: base, wasTruncated: true };
+  }
+
+  const remaining = effectiveMax - base.length;
+  if (addition.length <= remaining) {
+    return { result: base + addition, wasTruncated: false };
+  }
+  return { result: base + addition.slice(0, remaining), wasTruncated: true };
+}
+
 async function toModelMessage(
   messages: LlmIR[],
   systemPrompt?: () => Promise<string>,
@@ -291,6 +337,7 @@ export const runResponsesAgent: Compiler = async ({
     reasoningEffort?: "low" | "medium" | "high";
     reasoningSummary?: "auto";
   } = {};
+  const allowReasoning = model.reasoning != null;
   if (model.reasoning) {
     reasoningConfig.reasoningEffort = model.reasoning;
     reasoningConfig.reasoningSummary = "auto";
@@ -326,6 +373,7 @@ export const runResponsesAgent: Compiler = async ({
     let content = "";
     let reasoningId: string | undefined = undefined;
     let reasoningContent: string | undefined = undefined;
+    let cumulativeReasoningLength = 0;
     let usage = {
       input: 0,
       output: 0,
@@ -340,7 +388,7 @@ export const runResponsesAgent: Compiler = async ({
       switch (chunk.type) {
         case "text-delta":
           if (chunk.text) {
-            content += chunk.text;
+            content = appendCapped(content, chunk.text, MAX_ASSISTANT_CONTENT_CHARS);
             onTokens(chunk.text, "content");
           }
           break;
@@ -349,14 +397,24 @@ export const runResponsesAgent: Compiler = async ({
           break;
 
         case "reasoning-delta":
+          if (!allowReasoning) break;
           if (chunk.text) {
             if (reasoningContent == null) reasoningContent = "";
-            reasoningContent += chunk.text;
+            const result = appendCappedWithTracking(
+              reasoningContent,
+              chunk.text,
+              MAX_ASSISTANT_REASONING_CHARS,
+              cumulativeReasoningLength,
+              MAX_ASSISTANT_REASONING_CHARS,
+            );
+            reasoningContent = result.result;
+            cumulativeReasoningLength += chunk.text.length;
             onTokens(chunk.text, "reasoning");
           }
           break;
 
         case "reasoning-end":
+          if (!allowReasoning) break;
           const openai = chunk.providerMetadata ? chunk.providerMetadata["openai"] : {};
           const encrypted = openai["reasoningEncryptedContent"];
           if (encrypted && typeof encrypted === "string") {

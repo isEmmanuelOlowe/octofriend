@@ -7,7 +7,7 @@ import React, {
   createContext,
   useContext,
 } from "react";
-import { Text, Box, Static, measureElement, DOMElement, useInput, useApp } from "ink";
+import { Text, Box, Static, measureElement, DOMElement, useInput, useApp, useStdin } from "ink";
 import clipboardy from "clipboardy";
 import { InputWithHistory } from "./components/input-with-history.tsx";
 import { t } from "structural";
@@ -37,13 +37,22 @@ import mcp from "./tools/tool-defs/mcp.ts";
 import fetchTool from "./tools/tool-defs/fetch.ts";
 import skill from "./tools/tool-defs/skill.ts";
 import webSearch from "./tools/tool-defs/web-search.ts";
+import task from "./tools/tool-defs/task.ts";
 import { ALWAYS_REQUEST_PERMISSION_TOOLS, SKIP_CONFIRMATION_TOOLS } from "./tools/index.ts";
 import { ArgumentsSchema as EditArgumentSchema } from "./tools/tool-defs/edit.ts";
 import { ToolSchemaFrom } from "./tools/common.ts";
 import { useShallow } from "zustand/react/shallow";
 import { KbShortcutPanel } from "./components/kb-select/kb-shortcut-panel.tsx";
 import { Item, ShortcutArray } from "./components/kb-select/kb-shortcut-select.tsx";
-import { useAppStore, RunArgs, useModel, InflightResponseType } from "./state.ts";
+import {
+  useAppStore,
+  RunArgs,
+  useModel,
+  InflightResponseType,
+  useActiveAgent,
+  useAgentFocus,
+  useTaskDashboard,
+} from "./state.ts";
 import { Octo } from "./components/octo.tsx";
 import { Menu } from "./menu.tsx";
 import SelectInput from "./components/ink/select-input.tsx";
@@ -66,8 +75,13 @@ import { ScrollView, IsScrollableContext } from "./components/scroll-view.tsx";
 import { TerminalSizeTracker, useTerminalSize } from "./components/terminal-size.tsx";
 import { ToolCallRequest } from "./ir/llm-ir.ts";
 import { useShiftTab } from "./hooks/use-shift-tab.tsx";
+import { useTab } from "./hooks/use-tab.tsx";
 import { readFileSync } from "fs";
 import { CwdContext, useCwd } from "./hooks/use-cwd.tsx";
+import {
+  resolveRawSubagentNavSequence,
+  resolveSubagentNavShortcut,
+} from "./subagent-nav-shortcuts.ts";
 
 type Props = {
   config: Config;
@@ -79,6 +93,7 @@ type Props = {
   transport: Transport;
   inputHistory: InputHistory;
   bootSkills: string[];
+  bootAgents: string[];
 };
 
 type StaticItem =
@@ -127,20 +142,23 @@ export default function App({
   updates,
   inputHistory,
   bootSkills,
+  bootAgents,
 }: Props) {
   const [currConfig, setCurrConfig] = useState(config);
   const [isUnchained, setIsUnchained] = useState(unchained);
   const [tempNotification, setTempNotification] = useState<string | null>(
     isUnchained ? UNCHAINED_NOTIF : CHAINED_NOTIF,
   );
-  const { history, modeData, setVimMode, clearNonce } = useAppStore(
+  const { history, setVimMode, clearNonce, cycleAgent } = useAppStore(
     useShallow(state => ({
       history: state.history,
-      modeData: state.modeData,
       setVimMode: state.setVimMode,
       clearNonce: state.clearNonce,
+      cycleAgent: state.cycleAgent,
     })),
   );
+  const { focus, focusedTask, hasLiveTasks } = useAgentFocus();
+  const showFocusedLiveTask = hasLiveTasks && focus.type === "task" && focusedTask != null;
 
   useEffect(() => {
     if (updates != null) markUpdatesSeen();
@@ -153,6 +171,11 @@ export default function App({
     skillNotifs.push("Configured skills:");
     skillNotifs.push(...bootSkills.map(s => `- ${s}`));
   }
+  if (bootAgents.length > 0) {
+    skillNotifs.push(" ");
+    skillNotifs.push("Configured agents:");
+    skillNotifs.push(...bootAgents.map(a => `- ${a}`));
+  }
   useShiftTab(() => {
     setIsUnchained(prev => {
       const unchained = !prev;
@@ -163,6 +186,9 @@ export default function App({
       }
       return unchained;
     });
+  });
+  useTab(() => {
+    cycleAgent();
   });
 
   const staticItems: StaticItem[] = useMemo(() => {
@@ -185,17 +211,20 @@ export default function App({
               <CwdContext.Provider value={cwd}>
                 <ExitOnDoubleCtrlC>
                   <TerminalSizeTracker>
-                    <Box flexDirection="column" width="100%" height="100%">
+                    <Box flexDirection="column" width="100%">
                       <Static items={staticItems} key={clearNonce}>
                         {(item, index) => (
                           <StaticItemRenderer item={item} key={`static-${index}`} />
                         )}
                       </Static>
-                      {(modeData.mode === "responding" || modeData.mode === "compacting") &&
-                        (modeData.inflightResponse.reasoningContent ||
-                          modeData.inflightResponse.content) && (
-                          <MessageDisplay item={modeData.inflightResponse} />
-                        )}
+                      {showFocusedLiveTask ? (
+                        <FocusedTaskPanel />
+                      ) : (
+                        <>
+                          <InflightResponsePanel />
+                          {hasLiveTasks && focus.type === "main" && <MainTaskDashboard />}
+                        </>
+                      )}
                       <BottomBar
                         inputHistory={inputHistory}
                         metadata={metadata}
@@ -234,6 +263,8 @@ function BottomBar({
       modeData: state.modeData,
     })),
   );
+  const activeAgent = useActiveAgent();
+  const { focus, focusedTask, taskCount, focusIndex, hasLiveTasks } = useAgentFocus();
 
   useEffect(() => {
     getLatestVersion().then(latestVersion => {
@@ -266,13 +297,31 @@ function BottomBar({
   const unchained = useUnchained();
 
   return (
-    <Box flexDirection="column" width="100%">
+    <Box flexDirection="column" width="100%" flexShrink={0}>
       <BottomBarContent inputHistory={inputHistory} />
-      <Box width="100%" justifyContent="space-between" height={1} flexShrink={0} flexGrow={1}>
+      <Box width="100%" justifyContent="space-between" height={1} flexShrink={0}>
         <Box height={1}>
           <Text color={themeColor}>{ctrlCPressed && "Press Ctrl+C again to exit."}</Text>
           {!ctrlCPressed && (
             <Text color={"gray"}>
+              Agent: <Text>{activeAgent.name}</Text> <Text dimColor>(Tab to switch)</Text>
+              <Text> | </Text>
+              {hasLiveTasks && taskCount > 0 && focus.type === "task" && focusedTask ? (
+                <>
+                  View: <Text>@{focusedTask.subagentName}</Text>{" "}
+                  <Text dimColor>
+                    ({focusIndex + 1}/{taskCount})
+                  </Text>
+                  <Text> </Text>
+                  <Text dimColor>(Shift+Left / Shift+Right)</Text>
+                  <Text> | </Text>
+                </>
+              ) : hasLiveTasks && taskCount > 0 ? (
+                <>
+                  View: <Text>main</Text> <Text dimColor>(Shift+Left / Shift+Right)</Text>
+                  <Text> | </Text>
+                </>
+              ) : null}
               {unchained ? "⚡ Unchained mode" : "Collaboration mode"}{" "}
               <Text dimColor>(Shift+Tab to toggle)</Text>
             </Text>
@@ -289,6 +338,214 @@ function BottomBar({
           </Box>
         )}
       </Box>
+    </Box>
+  );
+}
+
+type TraceSegment =
+  | { type: "assistant"; content: string }
+  | { type: "reasoning"; content: string }
+  | { type: "tool-request"; toolName: string; args: string }
+  | { type: "tool-output"; lines: number }
+  | { type: "tool-error"; toolName: string; message: string }
+  | { type: "task-error"; message: string }
+  | { type: "user"; content: string };
+
+function parseTraceSegments(trace: string): TraceSegment[] {
+  const segments: TraceSegment[] = [];
+  const blocks = trace.split(/\n\n(?=\[)/);
+
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+
+    if (trimmed.startsWith("[assistant]")) {
+      segments.push({ type: "assistant", content: trimmed.slice("[assistant]".length).trim() });
+    } else if (trimmed.startsWith("[reasoning]")) {
+      segments.push({ type: "reasoning", content: trimmed.slice("[reasoning]".length).trim() });
+    } else if (trimmed.startsWith("[tool-request]")) {
+      const rest = trimmed.slice("[tool-request]".length).trim();
+      const firstNewline = rest.indexOf("\n");
+      const toolName = firstNewline === -1 ? rest : rest.slice(0, firstNewline).trim();
+      const args = firstNewline === -1 ? "" : rest.slice(firstNewline + 1).trim();
+      segments.push({ type: "tool-request", toolName, args });
+    } else if (trimmed.startsWith("[tool-output]")) {
+      const rest = trimmed.slice("[tool-output]".length).trim();
+      const lineCount = parseInt(rest, 10);
+      segments.push({ type: "tool-output", lines: isNaN(lineCount) ? 0 : lineCount });
+    } else if (trimmed.startsWith("[tool-error]")) {
+      const rest = trimmed.slice("[tool-error]".length).trim();
+      const firstNewline = rest.indexOf("\n");
+      const toolName = firstNewline === -1 ? rest : rest.slice(0, firstNewline).trim();
+      const message = firstNewline === -1 ? "" : rest.slice(firstNewline + 1).trim();
+      segments.push({ type: "tool-error", toolName, message });
+    } else if (trimmed.startsWith("[task-error]")) {
+      segments.push({ type: "task-error", message: trimmed.slice("[task-error]".length).trim() });
+    } else if (trimmed.startsWith("[user]")) {
+      segments.push({ type: "user", content: trimmed.slice("[user]".length).trim() });
+    }
+  }
+
+  return segments;
+}
+
+const TraceSegmentRenderer = React.memo(
+  ({ segment, taskId, index }: { segment: TraceSegment; taskId: string; index: number }) => {
+    const themeColor = useColor();
+
+    if (segment.type === "assistant") {
+      return (
+        <Box marginBottom={1}>
+          <OctoMessageRenderer>
+            <Box flexDirection="column" flexGrow={1}>
+              <Markdown markdown={segment.content} />
+            </Box>
+          </OctoMessageRenderer>
+        </Box>
+      );
+    }
+    if (segment.type === "reasoning") {
+      return (
+        <Box marginBottom={1} marginLeft={3}>
+          <Box flexDirection="column" borderStyle="single" paddingX={1} borderColor="gray">
+            <Text color="gray" dimColor>
+              Reasoning:
+            </Text>
+            <Text color="gray" dimColor wrap="wrap">
+              {segment.content}
+            </Text>
+          </Box>
+        </Box>
+      );
+    }
+    if (segment.type === "tool-request") {
+      return (
+        <Box marginTop={1}>
+          <Text color="gray">
+            {segment.toolName}
+            {segment.args ? `: ${segment.args.slice(0, 120)}` : ""}
+          </Text>
+        </Box>
+      );
+    }
+    if (segment.type === "tool-output") {
+      return (
+        <Box marginBottom={1}>
+          <Text color="gray">
+            Got <Text>{segment.lines}</Text> lines of output
+          </Text>
+        </Box>
+      );
+    }
+    if (segment.type === "tool-error") {
+      return (
+        <Box>
+          <Text color="red">
+            {segment.toolName ? `${segment.toolName}: ` : ""}Tool returned an error...
+          </Text>
+        </Box>
+      );
+    }
+    if (segment.type === "task-error") {
+      return (
+        <Box>
+          <Text color="red">{segment.message || "Task error"}</Text>
+        </Box>
+      );
+    }
+    if (segment.type === "user") {
+      return (
+        <Box marginY={1}>
+          <Box marginRight={1}>
+            <Text color="white">▶</Text>
+          </Box>
+          <Text>{segment.content}</Text>
+        </Box>
+      );
+    }
+    return null;
+  },
+);
+
+const MAX_RENDERED_SEGMENTS = 40;
+
+const TraceSegmentList = React.memo(
+  ({ segments, taskId }: { segments: TraceSegment[]; taskId: string }) => (
+    <Box flexDirection="column" paddingRight={4}>
+      {segments.map((segment, index) => (
+        <TraceSegmentRenderer
+          key={`${taskId}-seg-${index}`}
+          segment={segment}
+          taskId={taskId}
+          index={index}
+        />
+      ))}
+    </Box>
+  ),
+);
+
+function FocusedTaskPanel() {
+  const themeColor = useColor();
+  const terminalSize = useTerminalSize();
+  const { focus, focusedTask, focusIndex, taskCount } = useAgentFocus();
+  const lastTraceRef = useRef("");
+  const segmentsRef = useRef<TraceSegment[]>([]);
+
+  if (!focusedTask) return null;
+
+  // Only re-parse when trace actually changes
+  if (focusedTask.trace !== lastTraceRef.current) {
+    lastTraceRef.current = focusedTask.trace;
+    const allSegments = parseTraceSegments(focusedTask.trace);
+    segmentsRef.current =
+      allSegments.length > MAX_RENDERED_SEGMENTS
+        ? allSegments.slice(-MAX_RENDERED_SEGMENTS)
+        : allSegments;
+  }
+
+  const segments = segmentsRef.current;
+  const scrollHeight = Math.max(6, terminalSize.height - 8);
+
+  return (
+    <Box flexDirection="column" flexGrow={1} minHeight={0}>
+      <Box marginLeft={1}>
+        <Text color={themeColor} dimColor>
+          @{focusedTask.subagentName} ({focusIndex + 1}/{taskCount})
+        </Text>
+      </Box>
+      <ScrollView height={scrollHeight}>
+        <TraceSegmentList segments={segments} taskId={focusedTask.taskId} />
+      </ScrollView>
+    </Box>
+  );
+}
+
+function MainTaskDashboard() {
+  const themeColor = useColor();
+  const { hasLiveTasks } = useAgentFocus();
+  const { items, workingCount, failedCount } = useTaskDashboard();
+  if (!hasLiveTasks || items.length === 0) return null;
+
+  return (
+    <Box marginTop={1} marginLeft={1} flexDirection="column">
+      <Text color={themeColor}>
+        {workingCount > 0
+          ? `Parallel subagents running (${workingCount}/${items.length})`
+          : `Subagent activity (${items.length})`}
+      </Text>
+      {items.map(item => {
+        const color =
+          item.status === "failed" ? "red" : item.status === "working" ? themeColor : "gray";
+        const statusLabel =
+          item.status === "working" ? "working" : item.status === "failed" ? "failed" : "completed";
+        const callLabel = item.toolCalls === 1 ? "tool call" : "tool calls";
+        return (
+          <Text color={color} key={item.taskId}>
+            @{item.subagentName} {item.description} | {statusLabel} | {item.toolCalls} {callLabel}
+          </Text>
+        );
+      })}
+      {failedCount > 0 && <Text color="red">Some delegated subagents failed.</Text>}
     </Box>
   );
 }
@@ -323,6 +580,8 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
     setVimMode,
     query,
     setQuery,
+    focusNextTask,
+    focusPrevTask,
   } = useAppStore(
     useShallow(state => ({
       modeData: state.modeData,
@@ -334,11 +593,62 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
       setVimMode: state.setVimMode,
       query: state.query,
       setQuery: state.setQuery,
+      focusNextTask: state.focusNextTask,
+      focusPrevTask: state.focusPrevTask,
     })),
   );
+  const { taskCount } = useAgentFocus();
+  const { totalToolCalls, bytesReceived } = useTaskDashboard();
+  const { stdin } = useStdin();
+  const lastNavRef = useRef<{ at: number; direction: "next" | "prev" | null }>({
+    at: 0,
+    direction: null,
+  });
 
   const vimMode =
     vimEnabled && vimEnabled && modeData.mode === "input" ? modeData.vimMode : "NORMAL";
+
+  const navigateSubagent = useCallback(
+    (direction: "next" | "prev") => {
+      const now = Date.now();
+      if (lastNavRef.current.direction === direction && now - lastNavRef.current.at < 40) {
+        return;
+      }
+      lastNavRef.current = { at: now, direction };
+      if (direction === "next") focusNextTask();
+      else focusPrevTask();
+    },
+    [focusNextTask, focusPrevTask],
+  );
+  const handleSubagentSwitchKey = useCallback(
+    (
+      input: string,
+      key: {
+        ctrl?: boolean;
+        shift?: boolean;
+        meta?: boolean;
+        rightArrow?: boolean;
+        leftArrow?: boolean;
+      },
+    ) => {
+      const navDirection = resolveSubagentNavShortcut({
+        input,
+        key: {
+          ctrl: key.ctrl === true,
+          shift: key.shift === true,
+          meta: key.meta === true,
+          rightArrow: key.rightArrow === true,
+          leftArrow: key.leftArrow === true,
+        },
+        mode: modeData.mode,
+        taskCount,
+      });
+      if (!navDirection) return false;
+      navigateSubagent(navDirection);
+      return true;
+    },
+    [modeData.mode, taskCount, navigateSubagent],
+  );
 
   useCtrlC(() => {
     if (vimEnabled) return;
@@ -346,6 +656,10 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
   });
 
   useInput((input, key) => {
+    if (handleSubagentSwitchKey(input, key)) {
+      return;
+    }
+
     if (key.escape) {
       // Vim INSERT mode: Esc ONLY returns to NORMAL (no menu, no abort)
       if (vimEnabled && vimMode === "INSERT" && modeData.mode === "input") {
@@ -361,6 +675,23 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
       openMenu();
     }
   });
+
+  useEffect(() => {
+    if (!stdin || taskCount <= 0) return;
+
+    const onData = (chunk: string | Buffer) => {
+      const direction = resolveRawSubagentNavSequence(chunk.toString());
+      if (!direction) return;
+
+      if (modeData.mode === "input" || modeData.mode === "menu") return;
+      navigateSubagent(direction);
+    };
+
+    stdin.on("data", onData);
+    return () => {
+      stdin.off("data", onData);
+    };
+  }, [stdin, modeData.mode, taskCount, navigateSubagent]);
   const color = useColor();
 
   const onSubmit = useCallback(async () => {
@@ -369,20 +700,41 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
   }, [query, config, transport, setQuery]);
 
   if (modeData.mode === "responding" || modeData.mode === "compacting") {
+    const preparingToolCalls =
+      modeData.mode === "responding" &&
+      byteCount > 0 &&
+      !modeData.inflightResponse.content &&
+      !modeData.inflightResponse.reasoningContent;
+
     return (
-      <Box justifyContent="space-between">
-        <Loading
-          overrideStrings={
-            modeData.mode === "compacting"
-              ? ["Compacting history to save context tokens"]
-              : undefined
-          }
-        />
-        <Box>
-          {byteCount === 0 ? null : <Text color={color}>⇩ {byteCount} bytes</Text>}
-          <Text> </Text>
-          <Text color="gray">(Press ESC to interrupt)</Text>
+      <Box flexDirection="column">
+        <Box justifyContent="space-between">
+          <Loading
+            overrideStrings={
+              modeData.mode === "compacting"
+                ? ["Compacting history to save context tokens"]
+                : preparingToolCalls
+                  ? [
+                      "Preparing tool calls",
+                      "Planning delegated subtasks",
+                      "Building subagent requests",
+                    ]
+                  : undefined
+            }
+          />
+          <Box>
+            {byteCount === 0 ? null : <Text color={color}>⇩ {byteCount} bytes</Text>}
+            <Text> </Text>
+            <Text color="gray">(Press ESC to interrupt)</Text>
+          </Box>
         </Box>
+        <BusyInputRow
+          inputHistory={inputHistory}
+          query={query}
+          setQuery={setQuery}
+          onInputKey={handleSubagentSwitchKey}
+          message="Octo is working... (draft your next prompt)"
+        />
       </Box>
     );
   }
@@ -394,10 +746,42 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
     return <Loading overrideStrings={["Auto-fixing JSON"]} />;
   }
   if (modeData.mode === "tool-waiting") {
+    if (taskCount > 0) {
+      return (
+        <Box flexDirection="column">
+          <Box justifyContent="space-between">
+            <Loading overrideStrings={[`Running ${taskCount} delegated subagents in parallel`]} />
+            <Box>
+              <Text color={color}>⇩ {bytesReceived} bytes</Text>
+              <Text> </Text>
+              <Text color="gray">
+                {totalToolCalls} {totalToolCalls === 1 ? "tool call" : "tool calls"}
+              </Text>
+            </Box>
+          </Box>
+          <BusyInputRow
+            inputHistory={inputHistory}
+            query={query}
+            setQuery={setQuery}
+            onInputKey={handleSubagentSwitchKey}
+            message="Subagents are running... (draft your next prompt)"
+          />
+        </Box>
+      );
+    }
     return (
-      <Loading
-        overrideStrings={["Waiting", "Watching", "Smiling", "Hungering", "Splashing", "Writhing"]}
-      />
+      <Box flexDirection="column">
+        <Loading
+          overrideStrings={["Waiting", "Watching", "Smiling", "Hungering", "Splashing", "Writhing"]}
+        />
+        <BusyInputRow
+          inputHistory={inputHistory}
+          query={query}
+          setQuery={setQuery}
+          onInputKey={handleSubagentSwitchKey}
+          message="Waiting for tool output... (draft your next prompt)"
+        />
+      </Box>
     );
   }
   if (modeData.mode === "payment-error") {
@@ -428,7 +812,15 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
   }
 
   if (modeData.mode === "tool-request") {
-    return <ToolRequestRenderer toolReq={modeData.toolReq} config={config} transport={transport} />;
+    return (
+      <Box flexDirection="column">
+        <ToolRequestRenderer toolReq={modeData.toolReq} config={config} transport={transport} />
+        <ReadonlyInputRow
+          inputHistory={inputHistory}
+          message="Choose above. Composer stays visible."
+        />
+      </Box>
+    );
   }
 
   const _: "menu" | "input" = modeData.mode;
@@ -449,6 +841,67 @@ function BottomBarContent({ inputHistory }: { inputHistory: InputHistory }) {
       />
       <VimModeIndicator vimEnabled={vimEnabled} vimMode={vimMode} />
     </Box>
+  );
+}
+
+function ReadonlyInputRow({
+  inputHistory,
+  message,
+}: {
+  inputHistory: InputHistory;
+  message: string;
+}) {
+  return (
+    <InputWithHistory
+      inputHistory={inputHistory}
+      value=""
+      onChange={() => {}}
+      onSubmit={() => {}}
+      focus={false}
+      placeholder={message}
+      showBorder={false}
+      vimEnabled={false}
+      vimMode={"NORMAL"}
+      setVimMode={() => {}}
+    />
+  );
+}
+
+function BusyInputRow({
+  inputHistory,
+  query,
+  setQuery,
+  onInputKey,
+  message,
+}: {
+  inputHistory: InputHistory;
+  query: string;
+  setQuery: (query: string) => void;
+  onInputKey?: (
+    input: string,
+    key: {
+      ctrl?: boolean;
+      shift?: boolean;
+      meta?: boolean;
+      rightArrow?: boolean;
+      leftArrow?: boolean;
+    },
+  ) => boolean;
+  message: string;
+}) {
+  return (
+    <InputWithHistory
+      inputHistory={inputHistory}
+      value={query}
+      onChange={setQuery}
+      onSubmit={() => {}}
+      onInputKey={onInputKey}
+      placeholder={message}
+      showBorder={true}
+      vimEnabled={false}
+      vimMode={"NORMAL"}
+      setVimMode={() => {}}
+    />
   );
 }
 
@@ -664,6 +1117,8 @@ function ToolRequestRenderer({
         return `${fn.name}:*`;
       case "fetch":
         return `${fn.name}:*`;
+      case "task":
+        return `${fn.name}:*`;
       case "mcp":
         return `${fn.name}:${fn.arguments.server}:${fn.arguments.tool}`;
       case "web-search":
@@ -697,6 +1152,7 @@ function ToolRequestRenderer({
       case "shell":
       case "fetch":
       case "list":
+      case "task":
       case "mcp":
       case "web-search":
         return null;
@@ -784,12 +1240,14 @@ function ToolRequestRenderer({
 const StaticItemRenderer = React.memo(({ item }: { item: StaticItem }) => {
   const themeColor = useColor();
   const model = useModel();
+  const activeAgent = useActiveAgent();
   const unchained = useUnchained();
 
   if (item.type === "header") return <Header unchained={unchained} />;
   if (item.type === "version") {
     return (
       <Box marginTop={1} marginLeft={1} flexDirection="column">
+        <Text color="gray">Agent: {activeAgent.name}</Text>
         <Text color="gray">Model: {model.nickname}</Text>
         <Text color="gray">Version: {item.metadata.version}</Text>
       </Box>
@@ -826,6 +1284,19 @@ const StaticItemRenderer = React.memo(({ item }: { item: StaticItem }) => {
   }
 
   return <MessageDisplay item={item.item} />;
+});
+
+const InflightResponsePanel = React.memo(() => {
+  const { modeData } = useAppStore(
+    useShallow(state => ({
+      modeData: state.modeData,
+    })),
+  );
+
+  if (modeData.mode !== "responding" && modeData.mode !== "compacting") return null;
+  const inflight = modeData.inflightResponse;
+  if (!inflight.reasoningContent && !inflight.content) return null;
+  return <MessageDisplay item={inflight} />;
 });
 
 const MessageDisplay = React.memo(({ item }: { item: HistoryItem | InflightResponseType }) => {
@@ -982,9 +1453,32 @@ function ToolMessageRenderer({ item }: { item: ToolCallItem }) {
       return <RewriteToolRenderer item={item.tool.function} />;
     case "skill":
       return <SkillToolRenderer item={item.tool.function} />;
+    case "task":
+      return <TaskToolRenderer item={item.tool.function} />;
     case "web-search":
       return <WebSearchToolRenderer item={item.tool.function} />;
   }
+}
+
+function TaskToolRenderer({ item }: { item: ToolSchemaFrom<typeof task> }) {
+  const parallel = item.arguments.parallel_tasks ?? [];
+  if (parallel.length > 0) {
+    return (
+      <Box flexDirection="column">
+        <Text color="gray">task (parallel): {parallel.length} subtasks</Text>
+        <Text color="gray">
+          {parallel.map(entry => `@${entry.subagent_type} ${entry.description}`).join(" | ")}
+        </Text>
+      </Box>
+    );
+  }
+
+  return (
+    <Box flexDirection="column">
+      <Text color="gray">task: {item.arguments.description}</Text>
+      <Text color="gray">subagent: {item.arguments.subagent_type}</Text>
+    </Box>
+  );
 }
 
 function WebSearchToolRenderer(_: { item: ToolSchemaFrom<typeof webSearch> }) {
@@ -1208,6 +1702,9 @@ function WhitelistAllowDescription({ toolCallRequest }: { toolCallRequest: ToolC
     case "skill": {
       return <Text>{fn.arguments.skillName} skill executions</Text>;
     }
+    case "task": {
+      return <Text> subagent delegations</Text>;
+    }
   }
 }
 
@@ -1241,12 +1738,12 @@ function AssistantMessageRenderer({ item }: { item: InflightResponseType }) {
   let thoughts = item.reasoningContent ? item.reasoningContent.trim() : item.reasoningContent;
   let content = item.content.trim();
 
-  let reservedSpace = 6; // bottom bar + padding
-  const scrollViewHeight = Math.max(1, terminalSize.height - reservedSpace - 1);
-
+  // loading + busy input row + status bar + temp notification + padding
+  let reservedSpace = 7;
   const showThoughts = thoughts && thoughts !== "";
   // Reserve space for the borders of the thoughtbox
   if (showThoughts) reservedSpace += 2;
+  const scrollViewHeight = Math.max(1, terminalSize.height - reservedSpace - 1);
   return (
     <OctoMessageRenderer>
       <MaybeScrollView height={scrollViewHeight}>

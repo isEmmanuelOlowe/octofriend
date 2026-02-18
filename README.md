@@ -188,6 +188,58 @@ skills: {
 },
 ```
 
+## Multi-agent mode
+
+Octo now supports markdown-defined agents, including primary agents and
+delegated subagents.
+
+Agent files are discovered from:
+
+- `agents/**/*.md`
+- `.agents/agents/**/*.md`
+- `~/.config/octofriend/agents/**/*.md`
+
+### Agent file format
+
+```markdown
+---
+description: Investigate code quickly
+mode: subagent # primary | subagent | all
+model: Claude Haiku
+tools:
+  "*": false
+  read: true
+  list: true
+  fetch: true
+steps: 12
+---
+
+You are a focused exploration agent. Find relevant files and summarize findings.
+```
+
+- The markdown body is appended to that agent's system prompt.
+- `tools` controls per-agent tool access (`"*"` is the default rule).
+- `mode: subagent` agents are available for delegation via the `task` tool.
+
+### Switching agents
+
+- Press `Tab` to cycle through available primary agents.
+- Press `Shift+Tab` to toggle collaboration/unchained mode (existing behavior).
+- When delegated subagents are active, press `Shift+Right` / `Shift+Left` to move focus
+  between subagent views and the main view.
+
+### Delegating to subagents
+
+Primary agents can call the `task` tool:
+
+- `description`: short label for the delegated task
+- `prompt`: detailed subtask instructions
+- `subagent_type`: subagent name
+- `task_id` (optional): continue a previous delegated task session
+
+`task` returns a `task_id` and a `<task_result>...</task_result>` block that the
+parent agent can use for follow-up reasoning.
+
 ## Connecting Octo to MCP servers
 
 Octo can do a lot out of the box — pretty much anything is possible with enough

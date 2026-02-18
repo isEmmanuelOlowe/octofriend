@@ -5,6 +5,7 @@ import { getMcpClient } from "../tools/tool-defs/mcp.ts";
 import { LoadedTools } from "../tools/index.ts";
 import { tagged } from "../xml.ts";
 import { Transport, getEnvVar } from "../transports/transport-common.ts";
+import { Agent, subagentChoices } from "../agents/agents.ts";
 
 const LLM_INSTR_FILES = ["OCTO.md", "CLAUDE.md", "AGENTS.md"] as const;
 
@@ -13,11 +14,15 @@ export async function systemPrompt({
   transport,
   signal,
   tools,
+  agent,
+  agents,
 }: {
   config: Config;
   transport: Transport;
   signal: AbortSignal;
   tools: Partial<LoadedTools>;
+  agent?: Agent;
+  agents?: Agent[];
 }) {
   const pwd = await transport.shell(signal, "pwd", 5000);
   const currDir = await transport.readdir(signal, ".");
@@ -55,6 +60,8 @@ for the reissbaker/antipattern library, you might use the fetch tool to look up 
 
 ${await mcpPrompt(config)}
 
+${agentSection(agent, agents, tools)}
+
 # Don't ask for tool confirmation
 
 Don't ask ${config.yourName} whether they want you to run a tool or make file edits: instead, just
@@ -90,6 +97,10 @@ You can only run tools or edits one-by-one. After viewing tool output or editing
 to run more tools or edits in a step-by-step process. If you want to run multiple tools in a row,
 don't worry: just state your plan out loud, and then follow it over the course of multiple messages.
 Don't overthink.
+
+Important: you cannot run parallel tool calls directly in one model response. If you need parallel
+delegation, use the "task" tool's "parallel_tasks" field to run independent subagent tasks
+concurrently.
 
 # Coding guidelines
 
@@ -132,6 +143,50 @@ If you want to list other directories, use the list tool.
 
 ${await llmInstrsPrompt(transport, signal, config)}
 `.trim();
+}
+
+function agentSection(agent?: Agent, agents?: Agent[], tools?: Partial<LoadedTools>) {
+  if (!agent) return "";
+
+  const sections: string[] = [];
+  sections.push("# Active agent");
+  sections.push(`You are currently running as the "${agent.name}" agent (mode: ${agent.mode}).`);
+  if (agent.description) sections.push(`Agent description: ${agent.description}`);
+
+  if (agent.prompt.trim().length > 0) {
+    sections.push("");
+    sections.push("## Agent instructions");
+    sections.push(agent.prompt.trim());
+  }
+
+  const availableSubagents = subagentChoices(agents ?? []).filter(a => a.name !== agent.name);
+  if (availableSubagents.length > 0 && tools?.task) {
+    sections.push("");
+    sections.push("## Available subagents");
+    sections.push(
+      availableSubagents
+        .map(s => `- **${s.name}**${s.description ? `: ${s.description}` : ""}`)
+        .join("\n"),
+    );
+    sections.push("");
+    sections.push("## Delegation guidance");
+    sections.push(
+      `Use the \`task\` tool to delegate work to subagents. Key principles:
+
+- **Decompose before delegating**: break the task into discrete units with clear scope boundaries before spawning workers. Each unit must be independently executable and verifiable.
+- **Maximise parallelism**: use \`parallel_tasks\` for units with no dependencies on each other. Sequential work should be run after parallel prerequisites complete.
+- **Role matching**: choose the right subagent for each role —
+  - *explore* / *researcher*: read-only investigation, dependency mapping, impact analysis
+  - *general*: full-capability worker for implementation tasks
+  - *reviewer*: read-only quality gate — issues VERDICT after work is done
+  - *tester*: writes and runs tests, reports pass/fail
+  - *janitor*: post-verification cleanup only, never changes behaviour
+- **Scope in the prompt**: tell each worker explicitly what files/areas they own and what they must NOT touch.
+- **You are the orchestrator**: do not do the work yourself when it can be delegated. Your role is to plan, coordinate, verify, and synthesise — not to implement.`,
+    );
+  }
+
+  return sections.join("\n");
 }
 
 async function llmInstrsPrompt(transport: Transport, signal: AbortSignal, config: Config) {

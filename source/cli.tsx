@@ -35,6 +35,8 @@ import { loadInputHistory } from "./input-history/index.ts";
 import { makeAutofixJson } from "./compilers/autofix.ts";
 import { discoverSkills } from "./skills/skills.ts";
 import { timeout } from "./signals.ts";
+import { discoverAgents, primaryAgents, resolveActiveAgent } from "./agents/agents.ts";
+import { useAppStore } from "./state.ts";
 
 const __dirname = import.meta.dirname;
 
@@ -140,11 +142,23 @@ async function runMain(opts: { config?: string; unchained?: boolean; transport: 
     }
 
     const skills = await discoverSkills(opts.transport, timeout(5000), config);
+    const agents = await discoverAgents(opts.transport, timeout(5000));
     const cwd = await opts.transport.cwd(timeout(5000));
+
+    // Pre-populate the store with agents before render to avoid a post-mount
+    // async setState that causes Ink to repaint the screen and leave ghost
+    // input rows in the terminal scrollback.
+    useAppStore.setState({
+      agents,
+      activeAgentName: resolveActiveAgent(agents, null).name,
+    });
 
     const { waitUntilExit } = render(
       <App
         bootSkills={skills.map(s => s.name)}
+        bootAgents={primaryAgents(agents)
+          .filter(a => !a.native)
+          .map(a => a.name)}
         config={config}
         configPath={configPath}
         cwd={cwd}
